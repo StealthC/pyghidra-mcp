@@ -11,7 +11,7 @@
 O Ghidra Server é um serviço Java RMI que armazena **repositórios versionados**. Um projeto\
 compartilhado (`shared project`) não é um projeto que “fica no servidor”: ele continua sendo um\
 projeto local (`.gpr` + `.rep`), mas o seu armazenamento versionado é remoto. O `.rep` guarda, em\
-`project.properties`, o host, a porta e o nome do repositório; ao abrir o projeto, o cliente\
+`project.prp`, o host, a porta e o nome do repositório; ao abrir o projeto, o cliente\
 conecta-se ao servidor e usa um `RemoteFileSystem` como *versioned file system*.
 
 O fluxo oficial é:
@@ -47,7 +47,7 @@ Este documento usa os seguintes termos para evitar a ambiguidade de “importar 
 | **Projeto compartilhado local** | Projeto `.gpr`/`.rep` local cujo armazenamento versionado aponta para um repositório remoto. |
 | **Criar projeto compartilhado** | Criar repositório (se necessário) + criar o projeto local ligado a ele. |
 | **Entrar/join no repositório** | Criar um projeto local vazio ligado a um repositório existente; os arquivos versionados passam a ser listados. |
-| **Abrir projeto compartilhado** | Abrir um `.gpr` compartilhado já existente; o Ghidra lê `project.properties` e reconecta. |
+| **Abrir projeto compartilhado** | Abrir um `.gpr` compartilhado já existente; o Ghidra lê `project.prp` e reconecta. |
 | **Projeto transiente/remoto** | Acesso direto por `ghidra://host:port/repo[/pasta]`, sem `.gpr` local (usado pelo `analyzeHeadless`). |
 | **Importar binário** | Carregar um arquivo executável em uma pasta do projeto (privado até ser publicado). |
 | **Publicar** | `DomainFile.addToVersionControl(...)`: envia a primeira versão ao repositório. |
@@ -75,8 +75,11 @@ proposto aqui; ver decisões abertas.
   `server/server.conf` (`wrapper.java.maxmemory`). O README do servidor traz uma fórmula empírica\
   baseada na quantidade de arquivos e clientes.
 - TLS é usado por padrão. Se `-Dghidra.keystore` não for configurado, o servidor gera um\
-  certificado autoassinado temporário; clientes precisam confiar nele. Em PKI, o servidor usa\
-  `-Dghidra.cacerts` para validar certificados de cliente.
+  certificado autoassinado temporário. Sem `-Dghidra.cacerts`, o cliente Ghidra usa\
+  `DefaultTrustManagerFactory.OpenTrustManager` (trust-all), portanto aceita esse certificado\
+  sem configuração extra (confirmado no spike). Em PKI/CA customizada, o servidor usa\
+  `-Dghidra.cacerts` para validar certificados; esse é o modo em que a confiança precisa ser\
+  configurada.
 - O diretório de repositórios (`ghidra.repositories.dir`) deve ser dedicado, local e compatível\
   com o *filesystem watcher* do Ghidra. Ele contém os repositórios, o arquivo `users`, o arquivo\
   de ACL por repositório (`userAccess.acl`), o diretório `~ssh` e os logs (`server.log`). O\
@@ -100,14 +103,23 @@ Os parâmetros ficam em `server/server.conf` e são passados ao processo Java vi
 | `-ssh` | Permite autenticação por chave SSH, somente em conjunto com `-a0` e para clientes headless. |
 | `-ip`, `-ipAlt`, `-i`, `-p`, `-n` | Endereço publicado, nomes alternativos, interface, porta base e reverse DNS. |
 
-O servidor deve ser iniciado antes de qualquer operação de projeto. O `pyghidra-mcp` **não deve**gerenciar o processo do servidor (instalação de serviço, certificados, AD/JAAS); ele apenas é\
+**Ordem dos argumentos:** o `<repository_path>` deve ser o **último** argumento. Em\
+`server.conf`, por exemplo: `wrapper.app.parameter.1=-a0`, `.2=-p<porta>`, `.3=-e0`,\
+`.4=${ghidra.repositories.dir}`. Opções depois do path fazem o servidor sair com\
+`Invalid usage!` (confirmado no spike).
+
+O servidor deve ser iniciado antes de qualquer operação de projeto. O `pyghidra-mcp` **não deve**\
+gerenciar o processo do servidor (instalação de serviço, certificados, AD/JAAS); ele apenas é\
 cliente.
 
 ### 3.3 Usuários, autenticação e autorização
 
 - Todo usuário precisa ser previamente cadastrado no servidor. O `svrAdmin` é a ferramenta\
-  administrativa offline/administrativa:\
-  `-add`, `-remove`, `-reset`, `-list`, `-users`, `-dn`, `-grant`, `-revoke`, `-migrate`.
+  administrativa: `-add`, `-remove`, `-reset`, `-list`, `-users`, `-dn`, `-admin`, `-grant`,\
+  `-revoke`, `-migrate`. Ele exige o servidor **em execução** (precisa de `<repos>/users` e\
+  `<repos>/~admin`; caso contrário imprime `Invalid Ghidra server directory!`). Os comandos são\
+  enfileirados (`Command queued.`) e processados pelo servidor. O cabeçalho do script não lista\
+  `-grant`/`-revoke`, mas `ghidra.server.ServerAdmin` os aceita (confirmado).
 - **Não existe comando** `svrAdmin` **para criar repositório.** Repositórios são criados por um\
   cliente autenticado via `RepositoryServerAdapter.createRepository(name)`. Na implementação,\
   qualquer usuário válido (não anônimo) pode criar um repositório, e o criador recebe\
@@ -148,7 +160,11 @@ O repositório é um **filesystem versionado**. As operações são por `DomainF
     **Se o arquivo estiver aberto, o Ghidra força** `keepCheckedOut = true`.
 - `undoCheckout(keep)`: descarta o check-out; `keep=true` renomeia a cópia privada para `.keep`.
 - `merge(okToUpgrade, monitor)`: incorpora a versão mais recente do repositório no check-out\
-  local. É a operação que o Ghidra chama de **Update**. Não é permitida em projeto transiente.
+  local. É a operação que o Ghidra chama de **Update**. Não é permitida em projeto transiente.\
+  **Em modo headless, `merge` só funciona quando o check-out não tem alterações locais**\
+  (`modifiedSinceCheckout() == false`): nesse caso ele apenas atualiza o check-out para a versão\
+  mais recente. Com alterações locais, `GhidraFileData.merge` lança\
+  `IOException: Merge failed, merge is not supported in headless mode`. Confirmado no spike.
 - `getChangesByOthersSinceCheckout()`: retorna o `ChangeSet` com alterações de outros usuários\
   desde o check-out; útil para pré-visualizar conflitos.
 - `getLatestVersion()`, `getVersion()`, `getVersionHistory()`: versão mais recente, versão local\
@@ -189,8 +205,14 @@ Observações importantes de semântica:
   que dependem do servidor, mas check-outs transientes podem ser invalidados.
 - O `DefaultClientAuthenticator` pode abrir diálogos Swing. Em modo headless é obrigatório\
   instalar um autenticador headless antes de qualquer conexão.
-- `HeadlessClientAuthenticator` com `allowPasswordPrompt=true` lê da **stdin**; isso é\
-  incompatível com o transporte `stdio` do MCP. Em `stdio`, nunca habilitar prompt de senha.
+- `HeadlessClientAuthenticator` não recebe senha por parâmetro: sua assinatura é\
+  `installHeadlessClientAuthenticator(user, sshKeyFile, allowPasswordPrompt)`. Com\
+  `allowPasswordPrompt=false` ele falha o login; com `true` lê a senha da **stdin** (sem máscara)\
+  — incompatível com o transporte `stdio` do MCP. Para `-a0`, use\
+  `PasswordClientAuthenticator(user, password)` via `ClientUtil.setClientAuthenticator`.\
+  Além disso, sem o servidor iniciado com `-u`, o cliente envia `SystemUtilities.getUserName()`\
+  (cacheado de `user.name`), **não** o usuário do authenticator: é preciso iniciar a JVM com\
+  `-Duser.name=<usuário>` antes do primeiro uso. Confirmado no spike.
 - Em modo GUI, o projeto é do Ghidra; o MCP apenas o observa/opera. Em modo headless, o MCP é o\
   dono do `Project`/`ProjectData` e deve fechar corretamente.
 
@@ -203,16 +225,30 @@ Um projeto compartilhado local tem a mesma estrutura de um projeto comum:
 ```
 meu-projeto.gpr
 meu-projeto.rep/
-  project.properties     # owner, server, repository, port
+  project.prp     # XML: OWNER, SERVER, REPOSITORY_NAME, PORT_NUMBER
   ...
 meu-projeto-pyghidra-mcp/
   chromadb/
   gzfs/
 ```
 
-A diferença está em `project.properties`: quando `server` e `repository` estão presentes, o\
+A diferença está em `project.prp`: quando `SERVER` e `REPOSITORY_NAME` estão presentes, o\
 `DefaultProjectData` instancia um `RepositoryAdapter` e usa `RemoteFileSystem` como\
-`versionedFileSystem`. O `ProjectLocator` continua sendo local; `ProjectData.getSharedProjectURL()`devolve a URL `ghidra://host:port/repo` correspondente.
+`versionedFileSystem`. O arquivo é XML, por exemplo:
+
+```xml
+<FILE_INFO>
+  <BASIC_INFO>
+    <STATE NAME="OWNER" TYPE="string" VALUE="alice" />
+    <STATE NAME="SERVER" TYPE="string" VALUE="127.0.0.1" />
+    <STATE NAME="REPOSITORY_NAME" TYPE="string" VALUE="spike-repo" />
+    <STATE NAME="PORT_NUMBER" TYPE="int" VALUE="45000" />
+  </BASIC_INFO>
+</FILE_INFO>
+```
+
+O `ProjectLocator` continua sendo local; `ProjectData.getSharedProjectURL()` devolve a URL\
+`ghidra://host:port/repo` correspondente.
 
 ### 4.2 Criar um repositório
 
@@ -246,6 +282,7 @@ from ghidra.framework.model import ProjectLocator
 
 manager = PyGhidraProjectManager()
 locator = ProjectLocator(local_dir, project_name)   # diretório pai deve existir
+# 3º argumento = "remember"/recent projects; o modo compartilhado vem do repo_adapter
 project = manager.createProject(locator, repo_adapter, True)
 ```
 
@@ -273,7 +310,7 @@ Há três modalidades, com semânticas diferentes:
 
    - `GhidraProject.openProject(dir, name, restore)` ou\
      `DefaultProjectManager.openProject(locator, restore, resetOwner)`.
-   - O Ghidra lê `project.properties` e reconecta ao servidor/repositório. A autenticação precisa\
+   - O Ghidra lê `project.prp` e reconecta ao servidor/repositório. A autenticação precisa\
      estar instalada **antes** da abertura.
    - É o fluxo para quem já tem uma cópia local do projeto.
 
@@ -329,7 +366,7 @@ configurada por `--publish-imports`).
 | Gerenciar usuários do repo | `getUserList` / `setUserList` | Requer `ADMIN`; `User` tem `READ_ONLY`, `WRITE`, `ADMIN`. |
 | Criar projeto compartilhado | `DefaultProjectManager.createProject(locator, repo, remember)` | Diretório pai precisa existir. |
 | Converter projeto local | `ProjectData.convertProjectToShared(repo, monitor)` | Fechar/reabrir depois; arquivos viram privados. |
-| Abrir projeto compartilhado | `DefaultProjectManager.openProject` / `GhidraProject.openProject` | Lê `project.properties` e conecta. |
+| Abrir projeto compartilhado | `DefaultProjectManager.openProject` / `GhidraProject.openProject` | Lê `project.prp` e conecta. |
 | Acesso transiente | `GhidraURLQuery.queryRepositoryUrl` / `GhidraURLConnection` | Sem `.gpr`; cache `TransientProjectManager`. |
 | Importar binário | `ProgramLoader` (recomendado) ou `GhidraProject.importProgram` | Cria arquivo privado. |
 | Publicar arquivo novo | `DomainFile.addToVersionControl` | Primeira versão. |
@@ -359,13 +396,14 @@ configurada por `--publish-imports`).
 - `delete_program()` chama `DomainFile.delete()` sem política para versões/check-outs.
 
 `src/pyghidra_mcp/project_spec.py` só entende diretório + nome ou arquivo `.gpr`.\
-`src/pyghidra_mcp/server.py` expõe `--project-path` como `click.Path(exists=True)`, o que exclui\
-URLs `ghidra://` e não tem opções de servidor/autenticação.
+`src/pyghidra_mcp/server.py` expõe `--project-path` como `click.Path(path_type=Path)` (sem\
+`exists=True`), mas o valor é tratado como caminho local; URLs `ghidra://` não são suportadas e\
+não há opções de servidor/autenticação.
 
 ### 5.2 O que já funciona
 
 - Projetos locais e `.gpr` existentes, inclusive projetos que já sejam compartilhados: ao abrir,\
-  o Ghidra tenta conectar usando `project.properties`. Falta, porém, configurar autenticação\
+  o Ghidra tenta conectar usando `project.prp`. Falta, porém, configurar autenticação\
   headless antes da abertura.
 - Importação, análise, indexação e ferramentas de leitura/escrita em programas locais.
 - Modo GUI, que herda o suporte nativo do Ghidra a projetos compartilhados.
@@ -421,7 +459,7 @@ A prioridade usa MoSCoW: **M** = must, **S** = should, **C** = could.
 | FR-PRJ-04 | M | Converter projeto local existente em compartilhado, com aviso de que os arquivos precisam ser publicados novamente. |
 | FR-PRJ-05 | S | Abrir repositório em modo transiente via `ghidra://host:port/repo[/pasta]`, sem `.gpr`, fechando o `ProjectData` exatamente uma vez ao encerrar. |
 | FR-PRJ-06 | S | Modo read-only explícito para projeto/repositório, bloqueando ferramentas de escrita. |
-| FR-PRJ-07 | M | Detectar projeto já compartilhado e validar que servidor/repositório configurados coincidem com `project.properties`. |
+| FR-PRJ-07 | M | Detectar projeto já compartilhado e validar que servidor/repositório configurados coincidem com `project.prp`. |
 | FR-PRJ-08 | M | Falhar de forma clara se o projeto local estiver bloqueado por outro processo (`.lock`) ou se o diretório pai não existir. |
 | FR-PRJ-09 | M | Perder o mínimo de trabalho possível ao fechar: salvar apenas programas graváveis; nunca fazer check-in automático no shutdown. |
 | FR-PRJ-10 | C | Gerenciar múltiplos projetos/repositórios no mesmo processo (ver decisão aberta). |
@@ -449,7 +487,7 @@ A prioridade usa MoSCoW: **M** = must, **S** = should, **C** = could.
 | FR-VCS-05 | M | Antes do check-in, salvar o programa e validar `isChanged`, recovery e `modifiedSinceCheckout`; se não for possível, explicar exatamente o que falta. |
 | FR-VCS-06 | M | Fazer undo checkout com opção `keep` (padrão seguro) e exigir confirmação explícita para descartar alterações. |
 | FR-VCS-07 | M | Atualizar a árvore (`ProjectData.refresh`) e reportar arquivos cujo `latestVersion > version` (check-out desatualizado). |
-| FR-VCS-08 | M | Fazer update/merge explícito de um check-out, retornando versão anterior/nova e conflitos. |
+| FR-VCS-08 | M | Fazer update/merge explícito de um check-out, retornando versão anterior/nova e conflitos. Em headless, o merge de check-out com alterações locais não é suportado pelo Ghidra; o produto deve limitar-se a update de check-out sem alterações e reportar bloqueio explícito. |
 | FR-VCS-09 | S | Pré-visualizar alterações de terceiros (`getChangesByOthersSinceCheckout`) antes do merge. |
 | FR-VCS-10 | M | Listar versões de um arquivo (número, autor, data, comentário), com paginação. |
 | FR-VCS-11 | S | Abrir/ler uma versão específica sem alterar o check-out. |
@@ -472,7 +510,7 @@ A prioridade usa MoSCoW: **M** = must, **S** = should, **C** = could.
 | ID | Requisito |
 | --- | --- |
 | NFR-01 | **Compatibilidade**: funcionar com o cliente/servidor Ghidra suportados pelo projeto; detectar incompatibilidade de versão e orientar o usuário. A versão inspecionada usa interface de servidor 13. |
-| NFR-02 | **Segurança**: TLS sempre que o servidor usar; suportar CA customizada (`-Dghidra.cacerts`); não desabilitar verificação de certificado por padrão. |
+| NFR-02 | **Segurança**: TLS sempre que o servidor usar; suportar CA customizada (`-Dghidra.cacerts`). Atenção: sem `cacerts`, o cliente Ghidra usa trust-all (`OpenTrustManager`); o produto deve documentar isso e não tratar o default como verificação forte. |
 | NFR-03 | **Segredos**: credenciais nunca em argumentos de ferramenta MCP, URLs, logs ou arquivos de projeto; preferir env, arquivo com permissão `0600` e, opcionalmente, keyring. |
 | NFR-04 | **Isolamento**: um autenticador/identidade por processo JVM; não tentar usar credenciais diferentes para servidores diferentes no mesmo processo. |
 | NFR-05 | **Concorrência**: leituras podem ser concorrentes; operações de escrita (checkout, checkin, undo, merge, delete, publish) devem ser serializadas por arquivo e, se necessário, por projeto. |
@@ -582,7 +620,7 @@ Ferramentas de repositório e de ciclo de vida de arquivos podem ser expostas no
 | Criar projeto compartilhado | `--shared-project` | Requer repo novo ou existente. |
 | Entrar em repo existente | `--join-repository` | Cria `.gpr` local vazio. |
 | Converter projeto local | `--convert-to-shared` | Fechar/reabrir; publicar arquivos depois. |
-| Abrir `.gpr` compartilhado | `--project-path .../*.gpr` | Detecta shared por `project.properties`. |
+| Abrir `.gpr` compartilhado | `--project-path .../*.gpr` | Detecta shared por `project.prp`. |
 | Abrir transiente | `--project-path ghidra://...` | Sem `.gpr`; sujeito às limitações de transiente. |
 
 #### Ferramentas de runtime
@@ -701,6 +739,7 @@ Códigos estáveis propostos:
 | `recovery_data_present` | crash anterior | Não; recuperar/descartar recovery. |
 | `version_incompatible` | programa de versão antiga | Não; upgrade explícito. |
 | `merge_conflict` | conflito no update | Não; resolução manual. |
+| `merge_requires_gui` | check-out com alterações locais em modo headless | Não; update só é possível sem alterações locais; usar GUI, check-in ou undo. |
 | `delete_blocked` | check-out/uso/permissão | Não. |
 | `unknown_outcome` | timeout após escrita | Verificar estado; não repetir cegamente. |
 
@@ -783,7 +822,10 @@ sync_project(refresh=True, merge_checked_out=False):
 
 update_binary(file, ok_to_upgrade=False):
   validar canMerge
-  df.merge(ok_to_upgrade, monitor)   # falha se houver alterações não salvas/recovery
+  # Em headless o Ghidra só faz update de check-out SEM alterações locais.
+  # Com modifiedSinceCheckout()==true, merge lança
+  # "Merge failed, merge is not supported in headless mode".
+  df.merge(ok_to_upgrade, monitor)   # falha também com alterações não salvas/recovery
   fechar/reabrir programa; invalidar índice
   retornar versão anterior/nova e conflitos
 ```
@@ -847,10 +889,13 @@ update_binary(file, ok_to_upgrade=False):
 Criar um fixture que:
 
 1. Gera um `server.conf` temporário com `ghidra.repositories.dir` em `tmp_path`.
-2. Sobe `ghidraSvr console` em portas altas/livres (base + 1, base + 2) e espera o log.
-3. Executa `svrAdmin` para adicionar usuários (senha inicial) e, se necessário, `-grant`.
-4. Executa os cenários com `pyghidra` + `PasswordClientAuthenticator` e/ou\
-   `HeadlessClientAuthenticator`.
+2. Sobe `ghidraSvr console` em portas altas/livres (base, base+1, base+2), com `-a0 -e0` e o\
+   repository path como **último** argumento; espera `Registered Ghidra Server` no log.
+3. Só depois do startup, executa `svrAdmin -add` (senha inicial `changeme`) e, se necessário,\
+   `-grant`.
+4. Executa os cenários com `pyghidra` + `PasswordClientAuthenticator`; cada usuário precisa de\
+   uma JVM própria com `-Duser.name=<usuario>`. `HeadlessClientAuthenticator` não serve para\
+   senha sem prompt.
 5. Encerra o servidor e remove o diretório temporário.
 
 Cenários mínimos:
@@ -860,7 +905,8 @@ Cenários mínimos:
 | Criar repo + projeto + importar + publicar | alice | versão 1 visível para bob |
 | Join + checkout read-only | bob | arquivo listado e aberto read-only |
 | Checkout exclusivo concorrente | alice, bob | bob falha com código claro |
-| Checkout compartilhado + merge | alice, bob | versão 2 e merge sem conflito |
+| Checkout compartilhado + update | alice, bob | versão 2 e update de check-out sem alterações funciona |
+| Merge de check-out modificado | alice, bob | headless falha com `merge is not supported in headless mode`; estado preservado |
 | Conflito de merge | alice, bob | merge retorna conflito e estado consistente |
 | Undo checkout com keep | alice | `.keep` criado; versão preservada |
 | Usuário read-only | bob | checkout/checkin negados |
@@ -954,7 +1000,8 @@ Cenários mínimos:
 6. **Delete destrutivo**: `DomainFile.delete()` apaga todas as versões. Mitigação: confirmação,\
    `dry_run`, bloquear check-out de terceiros.
 7. **Self-signed TLS**: usuários podem ser tentados a desabilitar verificação. Mitigação:\
-   suportar CA customizada e nunca desabilitar por padrão.
+   suportar CA customizada e documentar que, sem `cacerts`, o cliente Ghidra já opera em\
+   trust-all (`OpenTrustManager`), o que não deve ser tratado como verificação forte.
 8. **Servidor como dependência de teste**: subir Ghidra Server em CI aumenta tempo/flakiness.\
    Mitigação: testes de integração marcados, portas dinâmicas, fixture robusto; testes unitários\
    cobrem a maior parte.
